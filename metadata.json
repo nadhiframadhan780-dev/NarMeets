@@ -1,0 +1,6 @@
+{
+  "name": "Ketemu",
+  "description": "Platform video meeting real-time ultra-low-delay berbasis arsitektur SFU dengan ruang tunggu, kontrol host, berbagi layar, dan dukungan LiveKit.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
