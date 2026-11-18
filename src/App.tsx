@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Language, ThemeMode, UserProfile } from './types/meeting';
-import { normalizeMeetingCode } from './utils/meetingLogic';
+import { generateMeetingCode, normalizeMeetingCode } from './utils/meetingLogic';
 import { LandingPage } from './components/LandingPage';
 import { Dashboard } from './components/Dashboard';
 import { PreJoinScreen, type PreJoinConfig } from './components/PreJoinScreen';
@@ -86,15 +86,24 @@ export default function App() {
           instant: true,
         }),
       });
-      const data = await res.json();
-      if (res.ok && data.meeting?.code) {
-        setActiveCode(data.meeting.code);
-        setExitBanner(null);
-        setView('prejoin');
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.meeting?.code) {
+          setActiveCode(data.meeting.code);
+          setExitBanner(null);
+          setView('prejoin');
+          return;
+        }
       }
     } catch {
-      // ignore network error
+      // Fallback to client-generated unpredictable meeting code if API is unreachable
     }
+
+    const fallbackCode = generateMeetingCode();
+    setActiveCode(fallbackCode);
+    setExitBanner(null);
+    setView('prejoin');
   }, [participantId, user]);
 
   const handleJoinMeetingCode = useCallback((code: string) => {

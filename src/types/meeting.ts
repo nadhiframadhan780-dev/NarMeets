@@ -73,6 +73,7 @@ export interface ReactionEvent {
 
 export interface RoomTokenResponse {
   mode: 'livekit' | 'webrtc-mesh';
+  serverless?: boolean;
   token: string | null;
   livekitUrl: string | null;
   region: string;

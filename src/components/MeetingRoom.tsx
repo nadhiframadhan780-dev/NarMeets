@@ -108,6 +108,8 @@ export function MeetingRoom({
   const speechRecRef = useRef<{ stop: () => void } | null>(null);
   const sidePanelRef = useRef(sidePanel);
   sidePanelRef.current = sidePanel;
+  const bcRef = useRef<BroadcastChannel | null>(null);
+  const serverlessModeRef = useRef(false);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -116,11 +118,67 @@ export function MeetingRoom({
     }, 4000);
   }, []);
 
-  const sendWs = useCallback((payload: WsClientMessage) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
-    }
-  }, []);
+  const sendWs = useCallback(
+    (payload: WsClientMessage) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(payload));
+        return;
+      }
+
+      if (!serverlessModeRef.current) return;
+
+      // Serverless mode (Vercel): handle local state, LiveKit DataChannel, and BroadcastChannel
+      const publishJson = (obj: unknown) => {
+        const raw = JSON.stringify(obj);
+        bcRef.current?.postMessage(obj);
+        if (lkRoomRef.current?.state === 'connected') {
+          const bytes = new TextEncoder().encode(raw);
+          void lkRoomRef.current.localParticipant.publishData(bytes, { reliable: true }).catch(() => {});
+        }
+      };
+
+      if (payload.type === 'participant:update') {
+        setParticipants((prev) =>
+          prev.map((p) => (p.id === participantId ? { ...p, ...payload.patch } : p))
+        );
+        publishJson({ type: 'dc:participant-update', senderId: participantId, patch: payload.patch });
+      } else if (payload.type === 'chat:send') {
+        const msg: ChatMessage = {
+          id: `msg_${crypto.randomUUID().slice(0, 12)}`,
+          meetingCode: config.code,
+          senderId: participantId,
+          senderName: config.displayName,
+          text: payload.text,
+          fileName: payload.fileName,
+          fileDataUrl: payload.fileDataUrl,
+          fileSize: payload.fileSize,
+          createdAt: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, msg]);
+        publishJson({ type: 'dc:chat', message: msg });
+      } else if (payload.type === 'reaction:send') {
+        const reaction: ReactionEvent = {
+          id: `rx_${crypto.randomUUID().slice(0, 8)}`,
+          senderId: participantId,
+          senderName: config.displayName,
+          emoji: payload.emoji,
+          timestamp: Date.now(),
+        };
+        setReactions((prev) => [...prev.slice(-10), reaction]);
+        setTimeout(() => {
+          setReactions((prev) => prev.filter((r) => r.id !== reaction.id));
+        }, 3200);
+        publishJson({ type: 'dc:reaction', reaction });
+      } else if (payload.type === 'host:toggle-lock') {
+        setIsLocked(payload.isLocked);
+        publishJson({ type: 'dc:lock', isLocked: payload.isLocked });
+      } else if (payload.type === 'host:end-meeting') {
+        publishJson({ type: 'dc:ended', endedBy: config.displayName });
+        onExitRoom('Meeting telah diakhiri.');
+      }
+    },
+    [config.code, config.displayName, onExitRoom, participantId]
+  );
 
   // Meeting timer
   useEffect(() => {
@@ -259,6 +317,34 @@ export function MeetingRoom({
           }),
         });
 
+        const contentType = tokenRes.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          serverlessModeRef.current = true;
+          const selfState: ParticipantState = {
+            id: participantId,
+            name: config.displayName,
+            role: 'host',
+            isMuted: config.isMuted,
+            isCamOff: config.isCamOff,
+            isScreenSharing: false,
+            isHandRaised: false,
+            isSpeaking: false,
+            connectionQuality: 'good',
+            joinedAt: new Date().toISOString(),
+            avatarColor: pickAvatarColor(config.displayName + participantId),
+          };
+          setParticipants([selfState]);
+          if (typeof BroadcastChannel !== 'undefined') {
+            const bc = new BroadcastChannel(`ketemu-room-${config.code}`);
+            bcRef.current = bc;
+            bc.onmessage = (ev) => handleDataPayload(ev.data);
+            bc.postMessage({ type: 'dc:join', participant: selfState });
+          }
+          showToast('Mode pratinjau lokal aktif.');
+          setPhase('joined');
+          return;
+        }
+
         const tokenData = (await tokenRes.json()) as RoomTokenResponse & { error?: string };
         if (!tokenRes.ok) {
           if (!unmounted) {
@@ -276,6 +362,76 @@ export function MeetingRoom({
         iceServersRef.current = tokenData.iceServers;
         activeMode = tokenData.mode;
 
+        const syncLiveKitParticipants = (lkRoom: Room) => {
+          const selfEntry: ParticipantState = {
+            id: participantId,
+            name: config.displayName,
+            role: tokenData.roomState.hostId === participantId ? 'host' : 'participant',
+            isMuted: !lkRoom.localParticipant.isMicrophoneEnabled,
+            isCamOff: !lkRoom.localParticipant.isCameraEnabled,
+            isScreenSharing: lkRoom.localParticipant.isScreenShareEnabled,
+            isHandRaised: false,
+            isSpeaking: lkRoom.localParticipant.isSpeaking,
+            connectionQuality: 'good',
+            joinedAt: new Date().toISOString(),
+            avatarColor: pickAvatarColor(config.displayName + participantId),
+          };
+          const remotes: ParticipantState[] = Array.from(lkRoom.remoteParticipants.values()).map((rp) => ({
+            id: rp.identity,
+            name: rp.name || rp.identity,
+            role: tokenData.roomState.hostId === rp.identity ? 'host' : 'participant',
+            isMuted: !rp.isMicrophoneEnabled,
+            isCamOff: !rp.isCameraEnabled,
+            isScreenSharing: rp.isScreenShareEnabled,
+            isHandRaised: false,
+            isSpeaking: rp.isSpeaking,
+            connectionQuality: 'good',
+            joinedAt: new Date().toISOString(),
+            avatarColor: pickAvatarColor((rp.name || rp.identity) + rp.identity),
+          }));
+          setParticipants([selfEntry, ...remotes]);
+        };
+
+        const handleDataPayload = (rawObj: unknown) => {
+          const ev = rawObj as {
+            type?: string;
+            senderId?: string;
+            patch?: Partial<ParticipantState>;
+            message?: ChatMessage;
+            reaction?: ReactionEvent;
+            isLocked?: boolean;
+            endedBy?: string;
+            participant?: ParticipantState;
+          };
+          if (!ev?.type) return;
+          if (ev.type === 'dc:chat' && ev.message) {
+            const incoming = ev.message;
+            setMessages((prev) => (prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]));
+            if (sidePanelRef.current !== 'chat' && incoming.senderId !== participantId) {
+              setUnreadChatCount((c) => c + 1);
+            }
+          } else if (ev.type === 'dc:reaction' && ev.reaction) {
+            const rx = ev.reaction;
+            setReactions((prev) => [...prev.slice(-10), rx]);
+            setTimeout(() => {
+              setReactions((prev) => prev.filter((r) => r.id !== rx.id));
+            }, 3200);
+          } else if (ev.type === 'dc:participant-update' && ev.senderId && ev.patch) {
+            setParticipants((prev) =>
+              prev.map((p) => (p.id === ev.senderId ? { ...p, ...ev.patch } : p))
+            );
+          } else if (ev.type === 'dc:join' && ev.participant && ev.participant.id !== participantId) {
+            const joinedP = ev.participant;
+            setParticipants((prev) =>
+              prev.some((p) => p.id === joinedP.id) ? prev : [...prev, joinedP]
+            );
+          } else if (ev.type === 'dc:lock' && typeof ev.isLocked === 'boolean') {
+            setIsLocked(ev.isLocked);
+          } else if (ev.type === 'dc:ended') {
+            onExitRoom(`Meeting telah diakhiri oleh ${ev.endedBy || 'Host'}.`);
+          }
+        };
+
         // If LiveKit Cloud SFU credentials are active, connect LiveKit SFU Room
         if (tokenData.mode === 'livekit' && tokenData.token && tokenData.livekitUrl) {
           const roomOpts = buildLiveKitRoomOptions({
@@ -288,6 +444,19 @@ export function MeetingRoom({
           lkRoom
             .on(RoomEvent.Reconnecting, () => setWsReconnecting(true))
             .on(RoomEvent.Reconnected, () => setWsReconnecting(false))
+            .on(RoomEvent.ParticipantConnected, () => syncLiveKitParticipants(lkRoom))
+            .on(RoomEvent.ParticipantDisconnected, () => syncLiveKitParticipants(lkRoom))
+            .on(RoomEvent.ActiveSpeakersChanged, () => syncLiveKitParticipants(lkRoom))
+            .on(RoomEvent.TrackMuted, () => syncLiveKitParticipants(lkRoom))
+            .on(RoomEvent.TrackUnmuted, () => syncLiveKitParticipants(lkRoom))
+            .on(RoomEvent.DataReceived, (payload) => {
+              try {
+                const decoded = JSON.parse(new TextDecoder().decode(payload));
+                handleDataPayload(decoded);
+              } catch {
+                // ignore malformed data packet
+              }
+            })
             .on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
               if (participant.isLocal) {
                 const mapped: ConnectionQualityLevel =
@@ -312,13 +481,51 @@ export function MeetingRoom({
               }
             });
 
-          await lkRoom.connect(tokenData.livekitUrl, tokenData.token, {
-            rtcConfig: tokenData.iceServers.length
-              ? { iceServers: tokenData.iceServers, iceTransportPolicy: 'all' }
-              : undefined,
-          });
-          await lkRoom.localParticipant.setMicrophoneEnabled(!config.isMuted);
-          await lkRoom.localParticipant.setCameraEnabled(!config.isCamOff);
+          try {
+            await lkRoom.connect(tokenData.livekitUrl, tokenData.token, {
+              rtcConfig: tokenData.iceServers.length
+                ? { iceServers: tokenData.iceServers, iceTransportPolicy: 'all' }
+                : undefined,
+            });
+            await lkRoom.localParticipant.setMicrophoneEnabled(!config.isMuted);
+            await lkRoom.localParticipant.setCameraEnabled(!config.isCamOff);
+            syncLiveKitParticipants(lkRoom);
+          } catch {
+            lkRoomRef.current = null;
+            activeMode = 'webrtc-mesh';
+            tokenData.mode = 'webrtc-mesh';
+            showToast('Koneksi LiveKit Cloud gagal; beralih ke mode cadangan.');
+          }
+        }
+
+        // Serverless hosting (Vercel): no persistent /ws server, enter room directly via LiveKit or BroadcastChannel
+        if (tokenData.serverless) {
+          serverlessModeRef.current = true;
+          const selfState: ParticipantState = {
+            id: participantId,
+            name: config.displayName,
+            role: tokenData.roomState.hostId === participantId ? 'host' : 'participant',
+            isMuted: config.isMuted,
+            isCamOff: config.isCamOff,
+            isScreenSharing: false,
+            isHandRaised: false,
+            isSpeaking: false,
+            connectionQuality: 'good',
+            joinedAt: new Date().toISOString(),
+            avatarColor: pickAvatarColor(config.displayName + participantId),
+          };
+          if (tokenData.mode !== 'livekit') {
+            setParticipants([selfState]);
+            if (typeof BroadcastChannel !== 'undefined') {
+              const bc = new BroadcastChannel(`ketemu-room-${config.code}`);
+              bcRef.current = bc;
+              bc.onmessage = (ev) => handleDataPayload(ev.data);
+              bc.postMessage({ type: 'dc:join', participant: selfState });
+            }
+            showToast('Mode pratinjau aktif. Tambahkan LIVEKIT_URL & API Key di Vercel untuk panggilan lintas perangkat.');
+          }
+          setPhase('joined');
+          return;
         }
 
         // Open authoritative WebSocket channel for state, chat, host moderation & signaling
@@ -474,7 +681,8 @@ export function MeetingRoom({
         openSocket();
       } catch {
         if (!unmounted) {
-          showToast('Gagal menginisialisasi koneksi meeting.');
+          setPhase('rejected');
+          setRejectReason('Gagal menginisialisasi koneksi meeting. Periksa koneksi internet atau konfigurasi server.');
         }
       }
     };
@@ -484,6 +692,8 @@ export function MeetingRoom({
     return () => {
       unmounted = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      bcRef.current?.close();
+      bcRef.current = null;
       wsRef.current?.close();
       void lkRoomRef.current?.disconnect();
       for (const pc of peerConnsRef.current.values()) {
